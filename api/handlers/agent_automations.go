@@ -19,6 +19,7 @@ import (
 	"github.com/laserstream/api/auth"
 	"github.com/laserstream/api/database"
 	"github.com/laserstream/api/models"
+	"github.com/laserstream/api/observability"
 )
 
 const (
@@ -279,8 +280,10 @@ func EvaluateAgentAutomation(c *fiber.Ctx) error {
 	defer cancel()
 
 	now := time.Now().UTC()
+	observability.AgentAutomationEvaluation()
 	evaluation, evalErr := evaluateAutomation(ctx, &automation, now, sendWebhook, dryRun, 5*time.Second)
 	if evalErr != nil {
+		observability.AgentAutomationFailure("evaluation_error")
 		automation.LastError = evalErr.Error()
 		automation.LastEvaluatedAt = &now
 		_ = database.DB.Save(&automation).Error
@@ -290,6 +293,9 @@ func EvaluateAgentAutomation(c *fiber.Ctx) error {
 			"error":      "automation evaluation failed",
 			"automation": automation,
 		})
+	}
+	if strings.TrimSpace(evaluation.Error) != "" {
+		observability.AgentAutomationFailure("delivery_error")
 	}
 
 	persistAutomationEvaluation(&automation, evaluation, evaluation.Error)
@@ -722,6 +728,9 @@ func sendAutomationWebhook(webhookURL string, evaluation automationEvaluation, t
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if err := applyWebhookSignatureHeaders(req, body); err != nil {
+		return err
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -846,6 +855,15 @@ type AgentAutomationRunner struct {
 	doneCh   chan struct{}
 }
 
+type AgentAutomationRetentionRunner struct {
+	cleanupInterval time.Duration
+	retention       time.Duration
+
+	stopOnce sync.Once
+	stopCh   chan struct{}
+	doneCh   chan struct{}
+}
+
 func NewAgentAutomationRunner(
 	pollInterval time.Duration,
 	evalTimeout time.Duration,
@@ -860,7 +878,20 @@ func NewAgentAutomationRunner(
 	}
 }
 
+func NewAgentAutomationRetentionRunner(cleanupInterval time.Duration, retention time.Duration) *AgentAutomationRetentionRunner {
+	return &AgentAutomationRetentionRunner{
+		cleanupInterval: cleanupInterval,
+		retention:       retention,
+		stopCh:          make(chan struct{}),
+		doneCh:          make(chan struct{}),
+	}
+}
+
 func (r *AgentAutomationRunner) Start() {
+	go r.loop()
+}
+
+func (r *AgentAutomationRetentionRunner) Start() {
 	go r.loop()
 }
 
@@ -871,10 +902,33 @@ func (r *AgentAutomationRunner) Stop() {
 	})
 }
 
+func (r *AgentAutomationRetentionRunner) Stop() {
+	r.stopOnce.Do(func() {
+		close(r.stopCh)
+		<-r.doneCh
+	})
+}
+
 func (r *AgentAutomationRunner) loop() {
 	defer close(r.doneCh)
 
 	ticker := time.NewTicker(r.pollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-r.stopCh:
+			return
+		case <-ticker.C:
+			r.runTick()
+		}
+	}
+}
+
+func (r *AgentAutomationRetentionRunner) loop() {
+	defer close(r.doneCh)
+
+	ticker := time.NewTicker(r.cleanupInterval)
 	defer ticker.Stop()
 
 	for {
@@ -905,9 +959,11 @@ func (r *AgentAutomationRunner) runTick() {
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), r.evalTimeout)
+		observability.AgentAutomationEvaluation()
 		evaluation, err := evaluateAutomation(ctx, &automation, now, true, automation.DryRun, r.webhookTimeout)
 		cancel()
 		if err != nil {
+			observability.AgentAutomationFailure("evaluation_error")
 			automation.LastError = err.Error()
 			automation.LastEvaluatedAt = &now
 			if saveErr := database.DB.Save(&automation).Error; saveErr != nil {
@@ -918,6 +974,9 @@ func (r *AgentAutomationRunner) runTick() {
 			}
 			continue
 		}
+		if strings.TrimSpace(evaluation.Error) != "" {
+			observability.AgentAutomationFailure("delivery_error")
+		}
 
 		persistAutomationEvaluation(&automation, evaluation, evaluation.Error)
 		if saveErr := database.DB.Save(&automation).Error; saveErr != nil {
@@ -927,6 +986,44 @@ func (r *AgentAutomationRunner) runTick() {
 			log.Printf("agent automation runner: failed to persist audit for automation=%d: %v", automation.ID, auditErr)
 		}
 	}
+}
+
+func (r *AgentAutomationRetentionRunner) runTick() {
+	if database.DB == nil {
+		return
+	}
+	if database.DB.Dialector.Name() != "postgres" {
+		return
+	}
+
+	retentionLiteral := formatIntervalLiteral(r.retention)
+	if strings.TrimSpace(retentionLiteral) == "" {
+		return
+	}
+
+	var deletedRows int64
+	if err := database.DB.Raw(
+		"SELECT purge_agent_automation_evaluations(?::interval)",
+		retentionLiteral,
+	).Scan(&deletedRows).Error; err != nil {
+		log.Printf("agent automation retention runner: cleanup failed: %v", err)
+		return
+	}
+
+	if deletedRows > 0 {
+		log.Printf("agent automation retention runner: purged %d old audit rows", deletedRows)
+	}
+}
+
+func formatIntervalLiteral(retention time.Duration) string {
+	if retention <= 0 {
+		return ""
+	}
+	seconds := int(retention.Seconds())
+	if seconds <= 0 {
+		seconds = 1
+	}
+	return fmt.Sprintf("%d seconds", seconds)
 }
 
 func isAutomationDue(automation *models.AgentAutomation, now time.Time) bool {

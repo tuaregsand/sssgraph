@@ -1,6 +1,7 @@
 package models
 
 import (
+	"encoding/json"
 	"time"
 )
 
@@ -62,4 +63,23 @@ type AgentAutomationEvaluation struct {
 	RetryAttempts int       `json:"retry_attempts" gorm:"not null;default:0"`
 	Error         string    `json:"error,omitempty" gorm:"type:text"`
 	CreatedAt     time.Time `json:"created_at"`
+}
+
+// WebhookReplayNonce stores previously seen webhook nonces to block replay attacks.
+type WebhookReplayNonce struct {
+	Nonce      string    `json:"nonce" gorm:"primaryKey;size:128"`
+	ReceivedAt time.Time `json:"received_at"`
+	ExpiresAt  time.Time `json:"expires_at" gorm:"index"`
+}
+
+// AgentInboundWebhook stores signed inbound webhook payloads for audit/debugging.
+type AgentInboundWebhook struct {
+	ID         uint            `json:"id" gorm:"primaryKey;autoIncrement"`
+	Nonce      string          `json:"nonce" gorm:"size:128;index"`
+	Signature  string          `json:"signature" gorm:"type:text;not null"`
+	KeyID      string          `json:"key_id" gorm:"type:text"`
+	SourceIP   string          `json:"source_ip" gorm:"type:text"`
+	Payload    json.RawMessage `json:"payload" gorm:"type:jsonb;not null"`
+	ReceivedAt time.Time       `json:"received_at" gorm:"index"`
+	CreatedAt  time.Time       `json:"created_at"`
 }

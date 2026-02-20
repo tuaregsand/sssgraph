@@ -1,20 +1,26 @@
 use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures::{SinkExt, StreamExt};
+use hmac::{Hmac, Mac};
 use log::{error, info, warn};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::Sha256;
 use solana_sdk::{pubkey::Pubkey, signature::Signature};
 use std::{
     collections::{HashMap, HashSet},
     env,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
     sync::{Mutex, RwLock},
     time::sleep,
 };
@@ -25,6 +31,8 @@ use yellowstone_grpc_proto::prelude::{
     SubscribeRequestFilterTransactions, SubscribeRequestPing, SubscribeUpdate,
     SubscribeUpdateAccount, SubscribeUpdateTransaction, subscribe_update::UpdateOneof,
 };
+
+type HmacSha256 = Hmac<Sha256>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -37,6 +45,17 @@ async fn main() -> Result<()> {
         config.endpoints.len(),
         config.program_ids.len()
     );
+
+    let metrics = MetricsRegistry::default();
+    if config.metrics_enabled {
+        let metrics_addr = config.metrics_addr.clone();
+        let metrics_registry = metrics.clone();
+        tokio::spawn(async move {
+            if let Err(err) = run_metrics_server(metrics_addr, metrics_registry).await {
+                error!("metrics server failed: {err:#}");
+            }
+        });
+    }
 
     let idl_cache = IdlCache::default();
     if let Some(idl_dsn) = &config.idl_dsn {
@@ -130,12 +149,16 @@ async fn main() -> Result<()> {
             config.agent_webhook_timeout,
             config.agent_webhook_max_attempts,
             config.agent_webhook_retry_initial_backoff,
+            config.webhook_signing_enabled,
+            config.webhook_signing_secret.clone(),
+            config.webhook_signing_key_id.clone(),
+            metrics.clone(),
         )?)
     } else {
         None
     };
 
-    run_ingestion_supervisor(config, idl_cache, publisher, dlq, agent_notifier).await
+    run_ingestion_supervisor(config, idl_cache, publisher, dlq, agent_notifier, metrics).await
 }
 
 #[derive(Debug, Clone)]
@@ -167,6 +190,11 @@ struct Config {
     agent_webhook_max_attempts: usize,
     agent_webhook_retry_initial_backoff: Duration,
     dlq_alert_threshold: usize,
+    metrics_enabled: bool,
+    metrics_addr: String,
+    webhook_signing_enabled: bool,
+    webhook_signing_secret: Option<String>,
+    webhook_signing_key_id: String,
 }
 
 impl Config {
@@ -203,6 +231,17 @@ impl Config {
         let agent_webhook_max_attempts = parse_u64_env("AGENT_WEBHOOK_MAX_ATTEMPTS", 2)? as usize;
         let agent_webhook_retry_backoff_ms =
             parse_u64_env("AGENT_WEBHOOK_RETRY_INITIAL_BACKOFF_MS", 200)?;
+        let metrics_enabled = parse_bool_env("METRICS_ENABLED", true);
+        let metrics_addr = env_or_default("METRICS_ADDR", "0.0.0.0:9102");
+        let webhook_signing_enabled = parse_bool_env("WEBHOOK_SIGNING_ENABLED", true);
+        let webhook_signing_secret = optional_env("WEBHOOK_SIGNING_SECRET");
+        let webhook_signing_key_id = env_or_default("WEBHOOK_SIGNING_KEY_ID", "laserstream-v1");
+
+        if webhook_signing_enabled && webhook_signing_secret.is_none() {
+            return Err(anyhow!(
+                "WEBHOOK_SIGNING_ENABLED=true but WEBHOOK_SIGNING_SECRET is empty"
+            ));
+        }
 
         Ok(Self {
             endpoints,
@@ -237,6 +276,11 @@ impl Config {
                 agent_webhook_retry_backoff_ms.max(1),
             ),
             dlq_alert_threshold: dlq_alert_threshold.max(1),
+            metrics_enabled,
+            metrics_addr,
+            webhook_signing_enabled,
+            webhook_signing_secret,
+            webhook_signing_key_id,
         })
     }
 }
@@ -467,6 +511,130 @@ async fn run_agent_webhook_refresh(
     }
 }
 
+#[derive(Clone, Default)]
+struct MetricsRegistry {
+    events_total: Arc<AtomicU64>,
+    published_total: Arc<AtomicU64>,
+    publish_failures_total: Arc<AtomicU64>,
+    agent_webhook_failures_total: Arc<AtomicU64>,
+    last_event_observed_ms: Arc<AtomicU64>,
+    last_publish_success_ms: Arc<AtomicU64>,
+    last_publish_failure_ms: Arc<AtomicU64>,
+}
+
+impl MetricsRegistry {
+    fn record_event_observed(&self, observed_at_unix_ms: u128) {
+        self.events_total.fetch_add(1, Ordering::Relaxed);
+        self.last_event_observed_ms
+            .store(u128_to_u64(observed_at_unix_ms), Ordering::Relaxed);
+    }
+
+    fn record_publish_success(&self) {
+        self.published_total.fetch_add(1, Ordering::Relaxed);
+        self.last_publish_success_ms
+            .store(u128_to_u64(now_unix_ms()), Ordering::Relaxed);
+    }
+
+    fn record_publish_failure(&self) {
+        self.publish_failures_total.fetch_add(1, Ordering::Relaxed);
+        self.last_publish_failure_ms
+            .store(u128_to_u64(now_unix_ms()), Ordering::Relaxed);
+    }
+
+    fn record_agent_webhook_failure(&self) {
+        self.agent_webhook_failures_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn ingestion_lag_ms(&self) -> u64 {
+        let last_event = self.last_event_observed_ms.load(Ordering::Relaxed);
+        if last_event == 0 {
+            return 0;
+        }
+        let now = u128_to_u64(now_unix_ms());
+        now.saturating_sub(last_event)
+    }
+
+    fn prometheus(&self) -> String {
+        let events_total = self.events_total.load(Ordering::Relaxed);
+        let published_total = self.published_total.load(Ordering::Relaxed);
+        let publish_failures_total = self.publish_failures_total.load(Ordering::Relaxed);
+        let agent_webhook_failures_total =
+            self.agent_webhook_failures_total.load(Ordering::Relaxed);
+        let last_event_observed_ms = self.last_event_observed_ms.load(Ordering::Relaxed);
+        let last_publish_success_ms = self.last_publish_success_ms.load(Ordering::Relaxed);
+        let last_publish_failure_ms = self.last_publish_failure_ms.load(Ordering::Relaxed);
+        let ingestion_lag_ms = self.ingestion_lag_ms();
+
+        format!(
+            "# TYPE ingester_events_total counter\n\
+ingester_events_total {events_total}\n\
+# TYPE ingester_published_total counter\n\
+ingester_published_total {published_total}\n\
+# TYPE ingester_publish_failures_total counter\n\
+ingester_publish_failures_total {publish_failures_total}\n\
+# TYPE ingester_agent_webhook_failures_total counter\n\
+ingester_agent_webhook_failures_total {agent_webhook_failures_total}\n\
+# TYPE ingester_last_event_observed_unix_ms gauge\n\
+ingester_last_event_observed_unix_ms {last_event_observed_ms}\n\
+# TYPE ingester_last_publish_success_unix_ms gauge\n\
+ingester_last_publish_success_unix_ms {last_publish_success_ms}\n\
+# TYPE ingester_last_publish_failure_unix_ms gauge\n\
+ingester_last_publish_failure_unix_ms {last_publish_failure_ms}\n\
+# TYPE ingester_ingestion_lag_ms gauge\n\
+ingester_ingestion_lag_ms {ingestion_lag_ms}\n"
+        )
+    }
+}
+
+async fn run_metrics_server(addr: String, metrics: MetricsRegistry) -> Result<()> {
+    let listener = TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("failed to bind metrics listener on {addr}"))?;
+    info!("Ingester metrics listening on http://{addr}/metrics");
+
+    loop {
+        let (mut socket, _) = listener.accept().await.context("metrics accept failed")?;
+        let registry = metrics.clone();
+
+        tokio::spawn(async move {
+            let mut read_buffer = vec![0u8; 2048];
+            let read_len = match socket.read(&mut read_buffer).await {
+                Ok(len) => len,
+                Err(err) => {
+                    warn!("metrics read failed: {err}");
+                    return;
+                }
+            };
+            if read_len == 0 {
+                return;
+            }
+
+            let request_line = String::from_utf8_lossy(&read_buffer[..read_len])
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string();
+
+            let (status_line, body) = if request_line.starts_with("GET /metrics ") {
+                ("HTTP/1.1 200 OK", registry.prometheus())
+            } else {
+                ("HTTP/1.1 404 Not Found", String::from("not found\n"))
+            };
+
+            let response = format!(
+                "{status_line}\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+
+            if let Err(err) = socket.write_all(response.as_bytes()).await {
+                warn!("metrics write failed: {err}");
+            }
+        });
+    }
+}
+
 #[derive(Clone)]
 enum Publisher {
     RedpandaProxy(RedpandaRestPublisher),
@@ -616,6 +784,10 @@ struct AgentNotifier {
     client: Client,
     max_attempts: usize,
     retry_initial_backoff: Duration,
+    signing_enabled: bool,
+    signing_secret: Option<String>,
+    signing_key_id: String,
+    metrics: MetricsRegistry,
 }
 
 impl AgentNotifier {
@@ -625,10 +797,20 @@ impl AgentNotifier {
         timeout: Duration,
         max_attempts: usize,
         retry_initial_backoff: Duration,
+        signing_enabled: bool,
+        signing_secret: Option<String>,
+        signing_key_id: String,
+        metrics: MetricsRegistry,
     ) -> Result<Self> {
         let static_url = static_url
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
+
+        if signing_enabled && signing_secret.is_none() {
+            return Err(anyhow!(
+                "WEBHOOK_SIGNING_ENABLED=true but WEBHOOK_SIGNING_SECRET is empty"
+            ));
+        }
 
         Ok(Self {
             static_url,
@@ -639,6 +821,10 @@ impl AgentNotifier {
                 .context("failed to build agent notifier client")?,
             max_attempts: max_attempts.max(1),
             retry_initial_backoff: retry_initial_backoff.max(Duration::from_millis(1)),
+            signing_enabled,
+            signing_secret,
+            signing_key_id,
+            metrics,
         })
     }
 
@@ -662,6 +848,7 @@ impl AgentNotifier {
             });
 
             if let Err(err) = self.send_with_retry(&target.url, &payload).await {
+                self.metrics.record_agent_webhook_failure();
                 warn!(
                     "Failed to send event_id={} to AI agent webhook route_id={} url={}: {err:#}",
                     event.event_id, target.route_id, target.url
@@ -710,9 +897,39 @@ impl AgentNotifier {
     async fn send_with_retry(&self, url: &str, payload: &Value) -> Result<()> {
         let mut backoff = self.retry_initial_backoff;
         let mut last_err: Option<anyhow::Error> = None;
+        let payload_bytes =
+            serde_json::to_vec(payload).context("failed to encode webhook payload")?;
 
         for attempt in 1..=self.max_attempts {
-            match self.client.post(url).json(payload).send().await {
+            let mut request = self
+                .client
+                .post(url)
+                .header("Content-Type", "application/json");
+
+            if self.signing_enabled {
+                let secret = self
+                    .signing_secret
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("webhook signing secret is empty"))?;
+                let timestamp = (now_unix_ms() / 1000).to_string();
+                let nonce = generate_webhook_nonce()?;
+                let signature = compute_webhook_signature(
+                    secret,
+                    &timestamp,
+                    &nonce,
+                    payload_bytes.as_slice(),
+                )?;
+
+                request = request
+                    .header("X-Laser-Timestamp", timestamp)
+                    .header("X-Laser-Nonce", nonce)
+                    .header("X-Laser-Signature", format!("v1={signature}"));
+                if !self.signing_key_id.trim().is_empty() {
+                    request = request.header("X-Laser-Key-Id", self.signing_key_id.clone());
+                }
+            }
+
+            match request.body(payload_bytes.clone()).send().await {
                 Ok(response) if response.status().is_success() => {
                     return Ok(());
                 }
@@ -953,6 +1170,7 @@ async fn publish_with_retry(
     event: &NormalizedEvent,
     max_attempts: usize,
     initial_backoff: Duration,
+    metrics: &MetricsRegistry,
 ) -> Result<()> {
     let attempts = max_attempts.max(1);
     let mut backoff = initial_backoff.max(Duration::from_millis(1));
@@ -960,7 +1178,10 @@ async fn publish_with_retry(
 
     for attempt in 1..=attempts {
         match publisher.publish(event).await {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                metrics.record_publish_success();
+                return Ok(());
+            }
             Err(err) => {
                 last_err = Some(err);
                 if attempt < attempts {
@@ -971,6 +1192,7 @@ async fn publish_with_retry(
         }
     }
 
+    metrics.record_publish_failure();
     Err(last_err.unwrap_or_else(|| anyhow!("publish failed with unknown error")))
 }
 
@@ -980,6 +1202,7 @@ async fn run_ingestion_supervisor(
     publisher: Publisher,
     dlq: Option<DlqStore>,
     agent_notifier: Option<AgentNotifier>,
+    metrics: MetricsRegistry,
 ) -> Result<()> {
     let mut endpoint_index = 0usize;
     let mut backoff = config.reconnect_initial_backoff;
@@ -994,7 +1217,15 @@ async fn run_ingestion_supervisor(
                 info!("Shutdown signal received");
                 return Ok(());
             }
-            result = run_endpoint_session(&config, &idl_cache, &publisher, dlq.as_ref(), agent_notifier.as_ref(), &endpoint) => result,
+            result = run_endpoint_session(
+                &config,
+                &idl_cache,
+                &publisher,
+                dlq.as_ref(),
+                agent_notifier.as_ref(),
+                &endpoint,
+                &metrics,
+            ) => result,
         };
 
         match session_result {
@@ -1018,6 +1249,7 @@ async fn run_endpoint_session(
     dlq: Option<&DlqStore>,
     agent_notifier: Option<&AgentNotifier>,
     endpoint: &str,
+    metrics: &MetricsRegistry,
 ) -> Result<()> {
     let mut builder = GeyserGrpcClient::build_from_shared(endpoint.to_string())
         .context("failed to create geyser client builder")?
@@ -1083,6 +1315,8 @@ async fn run_endpoint_session(
 
                 let events = normalize_update(update, idl_cache, endpoint).await;
                 for event in events {
+                    metrics.record_event_observed(event.observed_at_unix_ms);
+
                     if let Some(agent) = agent_notifier {
                         let agent_clone = agent.clone();
                         let event_clone = event.clone();
@@ -1096,6 +1330,7 @@ async fn run_endpoint_session(
                         &event,
                         config.publish_max_attempts,
                         config.publish_retry_initial_backoff,
+                        metrics,
                     ).await {
                         warn!(
                             "Failed to publish event_id={} program_id={}: {err:#}",
@@ -1398,6 +1633,42 @@ fn now_unix_ms() -> u128 {
         .unwrap_or_default()
 }
 
+fn u128_to_u64(value: u128) -> u64 {
+    value.min(u64::MAX as u128) as u64
+}
+
+fn generate_webhook_nonce() -> Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).context("failed to generate webhook nonce")?;
+    Ok(hex_encode(&bytes))
+}
+
+fn compute_webhook_signature(
+    secret: &str,
+    timestamp: &str,
+    nonce: &str,
+    payload: &[u8],
+) -> Result<String> {
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+        .context("failed to initialize webhook hmac signer")?;
+    mac.update(timestamp.as_bytes());
+    mac.update(b"\n");
+    mac.update(nonce.as_bytes());
+    mac.update(b"\n");
+    mac.update(payload);
+    Ok(hex_encode(mac.finalize().into_bytes().as_slice()))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const LUT: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(LUT[(byte >> 4) as usize] as char);
+        output.push(LUT[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
 fn pubkey_to_string(bytes: &[u8]) -> String {
     Pubkey::try_from(bytes)
         .map(|pubkey| pubkey.to_string())
@@ -1542,6 +1813,10 @@ mod tests {
             Duration::from_secs(1),
             1,
             Duration::from_millis(1),
+            false,
+            None,
+            String::new(),
+            MetricsRegistry::default(),
         )
         .expect("agent notifier should initialize");
 
@@ -1573,6 +1848,10 @@ mod tests {
             Duration::from_secs(1),
             1,
             Duration::from_millis(1),
+            false,
+            None,
+            String::new(),
+            MetricsRegistry::default(),
         )
         .expect("agent notifier should initialize");
 
@@ -1602,6 +1881,10 @@ mod tests {
             Duration::from_secs(1),
             1,
             Duration::from_millis(1),
+            false,
+            None,
+            String::new(),
+            MetricsRegistry::default(),
         )
         .expect("agent notifier should initialize");
 
@@ -1609,5 +1892,28 @@ mod tests {
         let targets = notifier.targets_for_event(&event).await;
 
         assert!(targets.is_empty(), "expected no delivery targets");
+    }
+
+    #[test]
+    fn compute_webhook_signature_is_deterministic() {
+        let payload = br#"{"event":"x"}"#;
+        let signature_a =
+            compute_webhook_signature("secret", "1700000000", "nonce-a", payload).unwrap();
+        let signature_b =
+            compute_webhook_signature("secret", "1700000000", "nonce-a", payload).unwrap();
+        let signature_c =
+            compute_webhook_signature("secret", "1700000001", "nonce-a", payload).unwrap();
+
+        assert_eq!(signature_a, signature_b);
+        assert_ne!(signature_a, signature_c);
+    }
+
+    #[test]
+    fn metrics_registry_tracks_ingestion_lag() {
+        let metrics = MetricsRegistry::default();
+        metrics.record_event_observed(1_000);
+
+        assert_eq!(metrics.events_total.load(Ordering::Relaxed), 1);
+        assert!(metrics.ingestion_lag_ms() > 0);
     }
 }

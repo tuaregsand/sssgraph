@@ -17,6 +17,7 @@ type Config struct {
 	WebSocket     WebSocketConfig
 	Auth          AuthConfig
 	Agent         AgentConfig
+	Webhook       WebhookConfig
 	RateLimit     RateLimitConfig
 	Observability ObservabilityConfig
 	Security      SecurityConfig
@@ -99,6 +100,17 @@ type AgentConfig struct {
 	AutomationPollInterval   time.Duration
 	AutomationEvalTimeout    time.Duration
 	AutomationWebhookTimeout time.Duration
+	AuditRetentionEnabled    bool
+	AuditRetention           time.Duration
+	AuditCleanupInterval     time.Duration
+}
+
+type WebhookConfig struct {
+	SigningEnabled     bool
+	SigningSecret      string
+	SigningKeyID       string
+	SignatureTolerance time.Duration
+	NonceTTL           time.Duration
 }
 
 type APIKeyConfig struct {
@@ -175,6 +187,16 @@ func Load() Config {
 			AutomationPollInterval:   getDurationEnv("AGENT_AUTOMATIONS_POLL_INTERVAL", time.Minute),
 			AutomationEvalTimeout:    getDurationEnv("AGENT_AUTOMATIONS_EVAL_TIMEOUT", 10*time.Second),
 			AutomationWebhookTimeout: getDurationEnv("AGENT_AUTOMATIONS_WEBHOOK_TIMEOUT", 5*time.Second),
+			AuditRetentionEnabled:    getBoolEnv("AGENT_AUTOMATION_AUDIT_RETENTION_ENABLED", true),
+			AuditRetention:           getDurationEnv("AGENT_AUTOMATION_AUDIT_RETENTION", 720*time.Hour),
+			AuditCleanupInterval:     getDurationEnv("AGENT_AUTOMATION_AUDIT_CLEANUP_INTERVAL", time.Hour),
+		},
+		Webhook: WebhookConfig{
+			SigningEnabled:     getBoolEnv("WEBHOOK_SIGNING_ENABLED", true),
+			SigningSecret:      getEnv("WEBHOOK_SIGNING_SECRET", ""),
+			SigningKeyID:       getEnv("WEBHOOK_SIGNING_KEY_ID", "laserstream-v1"),
+			SignatureTolerance: getDurationEnv("WEBHOOK_SIGNATURE_TOLERANCE", 5*time.Minute),
+			NonceTTL:           getDurationEnv("WEBHOOK_NONCE_TTL", 10*time.Minute),
 		},
 		RateLimit: RateLimitConfig{
 			Enabled:                  getBoolEnv("RATE_LIMIT_ENABLED", true),
@@ -231,6 +253,30 @@ func (c Config) Validate() error {
 		}
 		if c.Agent.AutomationWebhookTimeout <= 0 {
 			return errors.New("AGENT_AUTOMATIONS_WEBHOOK_TIMEOUT must be > 0")
+		}
+	}
+
+	if c.Agent.AuditRetentionEnabled {
+		if c.Agent.AuditRetention <= 0 {
+			return errors.New("AGENT_AUTOMATION_AUDIT_RETENTION must be > 0")
+		}
+		if c.Agent.AuditCleanupInterval <= 0 {
+			return errors.New("AGENT_AUTOMATION_AUDIT_CLEANUP_INTERVAL must be > 0")
+		}
+	}
+
+	if c.Webhook.SigningEnabled {
+		if strings.TrimSpace(c.Webhook.SigningSecret) == "" {
+			return errors.New("WEBHOOK_SIGNING_ENABLED=true but WEBHOOK_SIGNING_SECRET is empty")
+		}
+		if c.Webhook.SignatureTolerance <= 0 {
+			return errors.New("WEBHOOK_SIGNATURE_TOLERANCE must be > 0")
+		}
+		if c.Webhook.NonceTTL <= 0 {
+			return errors.New("WEBHOOK_NONCE_TTL must be > 0")
+		}
+		if c.Webhook.NonceTTL < c.Webhook.SignatureTolerance {
+			return errors.New("WEBHOOK_NONCE_TTL must be >= WEBHOOK_SIGNATURE_TOLERANCE")
 		}
 	}
 

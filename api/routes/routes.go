@@ -41,6 +41,8 @@ func SetupRoutes(app *fiber.App, manager *stream.Manager, opts Options) {
 
 	api.Post("/agent/webhooks", adminAuth, handlers.CreateAgentWebhook)
 	api.Get("/agent/webhooks", adminAuth, handlers.GetAgentWebhooks)
+	api.Post("/agent/webhooks/inbound", handlers.AgentInboundWebhook)
+	api.Get("/agent/webhooks/inbound", adminAuth, handlers.GetAgentInboundWebhooks)
 	api.Post("/agent/query", readAuth, handlers.AgentQuery)
 	api.Post("/agent/query/report", readAuth, handlers.AgentQueryReport)
 	api.Post("/agent/backtest/launches", readAuth, handlers.AgentBacktestLaunches)

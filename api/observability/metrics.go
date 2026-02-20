@@ -23,14 +23,20 @@ type requestStats struct {
 	DurationSum uint64
 }
 
+type stageCounter map[string]uint64
+
 type Registry struct {
 	mu       sync.RWMutex
 	requests map[requestKey]requestStats
+	queryErr stageCounter
+	autoErr  stageCounter
 
 	wsCurrentConnections  int64
 	wsRejectedConnections uint64
 	wsSlowDrops           uint64
 	wsMessagesOut         uint64
+	queryExecutions       uint64
+	automationEvaluations uint64
 }
 
 var Metrics = NewRegistry()
@@ -38,6 +44,8 @@ var Metrics = NewRegistry()
 func NewRegistry() *Registry {
 	return &Registry{
 		requests: make(map[requestKey]requestStats),
+		queryErr: make(stageCounter),
+		autoErr:  make(stageCounter),
 	}
 }
 
@@ -106,6 +114,28 @@ func WSMessageOut() {
 	atomic.AddUint64(&Metrics.wsMessagesOut, 1)
 }
 
+func AgentQueryExecution() {
+	atomic.AddUint64(&Metrics.queryExecutions, 1)
+}
+
+func AgentQueryError(stage string) {
+	stage = sanitizeStage(stage)
+	Metrics.mu.Lock()
+	Metrics.queryErr[stage]++
+	Metrics.mu.Unlock()
+}
+
+func AgentAutomationEvaluation() {
+	atomic.AddUint64(&Metrics.automationEvaluations, 1)
+}
+
+func AgentAutomationFailure(stage string) {
+	stage = sanitizeStage(stage)
+	Metrics.mu.Lock()
+	Metrics.autoErr[stage]++
+	Metrics.mu.Unlock()
+}
+
 func (r *Registry) prometheus() string {
 	var builder strings.Builder
 	builder.WriteString("# TYPE api_http_requests_total counter\n")
@@ -114,6 +144,10 @@ func (r *Registry) prometheus() string {
 	builder.WriteString("# TYPE api_ws_rejected_connections_total counter\n")
 	builder.WriteString("# TYPE api_ws_slow_client_drops_total counter\n")
 	builder.WriteString("# TYPE api_ws_messages_out_total counter\n")
+	builder.WriteString("# TYPE api_agent_query_executions_total counter\n")
+	builder.WriteString("# TYPE api_agent_query_errors_total counter\n")
+	builder.WriteString("# TYPE api_agent_automation_evaluations_total counter\n")
+	builder.WriteString("# TYPE api_agent_automation_failures_total counter\n")
 
 	r.mu.RLock()
 	keys := make([]requestKey, 0, len(r.requests))
@@ -164,5 +198,66 @@ func (r *Registry) prometheus() string {
 	builder.WriteString(strconv.FormatUint(atomic.LoadUint64(&r.wsMessagesOut), 10))
 	builder.WriteByte('\n')
 
+	builder.WriteString("api_agent_query_executions_total ")
+	builder.WriteString(strconv.FormatUint(atomic.LoadUint64(&r.queryExecutions), 10))
+	builder.WriteByte('\n')
+
+	builder.WriteString("api_agent_automation_evaluations_total ")
+	builder.WriteString(strconv.FormatUint(atomic.LoadUint64(&r.automationEvaluations), 10))
+	builder.WriteByte('\n')
+
+	r.mu.RLock()
+	queryErrStages := make([]string, 0, len(r.queryErr))
+	for stage := range r.queryErr {
+		queryErrStages = append(queryErrStages, stage)
+	}
+	sort.Strings(queryErrStages)
+	for _, stage := range queryErrStages {
+		builder.WriteString("api_agent_query_errors_total{stage=")
+		builder.WriteString(strconv.Quote(stage))
+		builder.WriteString("} ")
+		builder.WriteString(strconv.FormatUint(r.queryErr[stage], 10))
+		builder.WriteByte('\n')
+	}
+
+	autoErrStages := make([]string, 0, len(r.autoErr))
+	for stage := range r.autoErr {
+		autoErrStages = append(autoErrStages, stage)
+	}
+	sort.Strings(autoErrStages)
+	for _, stage := range autoErrStages {
+		builder.WriteString("api_agent_automation_failures_total{stage=")
+		builder.WriteString(strconv.Quote(stage))
+		builder.WriteString("} ")
+		builder.WriteString(strconv.FormatUint(r.autoErr[stage], 10))
+		builder.WriteByte('\n')
+	}
+	r.mu.RUnlock()
+
 	return builder.String()
+}
+
+func sanitizeStage(value string) string {
+	value = strings.TrimSpace(strings.ToLower(value))
+	if value == "" {
+		return "unknown"
+	}
+
+	var out strings.Builder
+	for _, ch := range value {
+		switch {
+		case ch >= 'a' && ch <= 'z':
+			out.WriteRune(ch)
+		case ch >= '0' && ch <= '9':
+			out.WriteRune(ch)
+		case ch == '_' || ch == '-':
+			out.WriteRune(ch)
+		default:
+			out.WriteByte('_')
+		}
+	}
+	if out.Len() == 0 {
+		return "unknown"
+	}
+	return out.String()
 }

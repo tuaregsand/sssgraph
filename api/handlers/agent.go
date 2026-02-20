@@ -19,6 +19,7 @@ import (
 	"github.com/laserstream/api/auth"
 	"github.com/laserstream/api/database"
 	"github.com/laserstream/api/models"
+	"github.com/laserstream/api/observability"
 )
 
 const (
@@ -128,6 +129,7 @@ func GetAgentWebhooks(c *fiber.Ctx) error {
 func AgentQuery(c *fiber.Ctx) error {
 	var payload queryPayload
 	if err := c.BodyParser(&payload); err != nil {
+		observability.AgentQueryError("request_parse")
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "cannot parse JSON"})
 	}
 
@@ -137,6 +139,7 @@ func AgentQuery(c *fiber.Ctx) error {
 func AgentQueryReport(c *fiber.Ctx) error {
 	var payload queryPayload
 	if err := c.BodyParser(&payload); err != nil {
+		observability.AgentQueryError("request_parse")
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "cannot parse JSON"})
 	}
 
@@ -149,24 +152,30 @@ func AgentQueryReport(c *fiber.Ctx) error {
 }
 
 func runAgentQuery(c *fiber.Ctx, payload queryPayload) error {
+	observability.AgentQueryExecution()
+
 	prompt := strings.TrimSpace(payload.Prompt)
 	if prompt == "" {
+		observability.AgentQueryError("prompt_validation")
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "prompt is required"})
 	}
 
 	queryMode, execute, err := resolveAgentQueryMode(payload.Mode, payload.Execute, payload.StrictVerified)
 	if err != nil {
+		observability.AgentQueryError("mode_validation")
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
 
 	eventsTable := resolveAgentQueryTable()
 	sqlQuery, generationStatus, err := generateSQLFromPrompt(prompt, os.Getenv("OPENAI_API_KEY"), eventsTable)
 	if err != nil {
+		observability.AgentQueryError("sql_generation")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
 	}
 
 	readOnlySQL, err := normalizeReadOnlySQL(sqlQuery)
 	if err != nil {
+		observability.AgentQueryError("sql_validation")
 		return c.Status(fiber.StatusUnprocessableEntity).JSON(fiber.Map{
 			"prompt":              prompt,
 			"sql":                 sqlQuery,
@@ -178,6 +187,7 @@ func runAgentQuery(c *fiber.Ctx, payload queryPayload) error {
 	}
 
 	if queryMode == agentQueryModeReport && !queryReferencesTable(readOnlySQL, eventsTable) {
+		observability.AgentQueryError("strict_table_validation")
 		return c.Status(fiber.StatusUnprocessableEntity).JSON(fiber.Map{
 			"prompt":            prompt,
 			"sql":               readOnlySQL,
@@ -213,6 +223,7 @@ func runAgentQuery(c *fiber.Ctx, payload queryPayload) error {
 
 		rows, queryErr := analytics.QueryRows(ctx, executionQuery)
 		if queryErr != nil {
+			observability.AgentQueryError("query_execution")
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 				"prompt":            prompt,
 				"sql":               readOnlySQL,

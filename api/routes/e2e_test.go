@@ -2,6 +2,9 @@ package routes
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -22,6 +25,9 @@ import (
 
 func TestAPIEndToEndFlow(t *testing.T) {
 	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("WEBHOOK_SIGNING_ENABLED", "true")
+	t.Setenv("WEBHOOK_SIGNING_SECRET", "e2e-webhook-secret")
+	t.Setenv("WEBHOOK_SIGNING_KEY_ID", "e2e-key")
 
 	db := setupE2EDatabase(t)
 	database.DB = db
@@ -73,6 +79,7 @@ func TestAPIEndToEndFlow(t *testing.T) {
 	if createdWebhookID == 0 {
 		t.Fatalf("expected webhook to be created")
 	}
+	assertInboundWebhookReplayProtectionForE2E(t, app)
 
 	assertAgentQueryEvidenceForE2E(t, app)
 
@@ -101,6 +108,8 @@ func setupE2EDatabase(t *testing.T) *gorm.DB {
 		&models.AgentWebhook{},
 		&models.AgentAutomation{},
 		&models.AgentAutomationEvaluation{},
+		&models.WebhookReplayNonce{},
+		&models.AgentInboundWebhook{},
 	); err != nil {
 		t.Fatalf("failed to migrate sqlite schema: %v", err)
 	}
@@ -312,6 +321,55 @@ func assertBacktestEndpointsForE2E(t *testing.T, app *fiber.App) {
 	if scoreResp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200 from score endpoint, got %d", scoreResp.StatusCode)
 	}
+}
+
+func assertInboundWebhookReplayProtectionForE2E(t *testing.T, app *fiber.App) {
+	t.Helper()
+
+	body := []byte(`{"source":"agent","event":"hello"}`)
+	timestamp := time.Now().UTC().Format(time.RFC3339)
+	nonce := "e2e-nonce-1"
+	signature := webhookSignatureForE2E("e2e-webhook-secret", timestamp, nonce, body)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/agent/webhooks/inbound", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Laser-Timestamp", timestamp)
+	req.Header.Set("X-Laser-Nonce", nonce)
+	req.Header.Set("X-Laser-Signature", "v1="+signature)
+	req.Header.Set("X-Laser-Key-Id", "e2e-key")
+
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("unexpected inbound webhook error: %v", err)
+	}
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("expected 202 for signed inbound webhook, got %d", resp.StatusCode)
+	}
+
+	replayReq := httptest.NewRequest(http.MethodPost, "/api/agent/webhooks/inbound", bytes.NewReader(body))
+	replayReq.Header.Set("Content-Type", "application/json")
+	replayReq.Header.Set("X-Laser-Timestamp", timestamp)
+	replayReq.Header.Set("X-Laser-Nonce", nonce)
+	replayReq.Header.Set("X-Laser-Signature", "v1="+signature)
+	replayReq.Header.Set("X-Laser-Key-Id", "e2e-key")
+
+	replayResp, err := app.Test(replayReq)
+	if err != nil {
+		t.Fatalf("unexpected replay request error: %v", err)
+	}
+	if replayResp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 for replayed nonce, got %d", replayResp.StatusCode)
+	}
+}
+
+func webhookSignatureForE2E(secret, timestamp, nonce string, body []byte) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(timestamp))
+	mac.Write([]byte("\n"))
+	mac.Write([]byte(nonce))
+	mac.Write([]byte("\n"))
+	mac.Write(body)
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 func formatID(id float64) string {

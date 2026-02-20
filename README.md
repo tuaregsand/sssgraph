@@ -1,108 +1,116 @@
 # Solana Super-Graph Engine (LaserStream + Go API)
 
-two deployable services:
+This repository contains two deployable services:
 
-- `ingester/`: Rust ingestion pipeline
-- `api/`: Go API + WebSocket fanout gateway
+- `ingester/`: Rust ingestion + normalization + webhook fanout
+- `api/`: Go API + WebSocket gateway + agent intelligence endpoints
 
-Rust ingester (`ingester/`)
+## Implemented Features
 
-- Connects to Helius LaserStream Yellowstone gRPC endpoints with token auth.
-- Subscribes to transaction/account updates filtered by configured PROGRAM_IDS.
-- Implements endpoint failover with exponential backoff.
-- Maintains a dynamic IDL cache by reading idls from PostgreSQL (`PG_DSN`) on a refresh interval.
-- Maintains a dynamic AI-agent webhook route cache by reading active agent_webhook, rows from PostgreSQL (`AGENT_WEBHOOKS_PG_DSN` or `PG_DSN`) on a refresh interval.
-- Normalizes matching events into JSON envelopes.
-- Publishes normalized events to Redpanda via Kafka REST Proxy (binary records), partition-keyed by signature/program/account.
-- Falls back to stdout publishing when proxy URL is not configured.
-- Uses publish retries before writing failed records to a DLQ JSONL file.
-- Replays DLQ backlog on an interval and can emit webhook alerts when backlog crosses threshold.
+### Rust ingester (`ingester/`)
+
+- Helius LaserStream Yellowstone gRPC ingestion with endpoint failover.
+- Dynamic IDL cache refresh from PostgreSQL.
+- Dynamic AI-agent webhook route refresh from PostgreSQL.
+- Event normalization + Redpanda REST publish + DLQ replay.
+- Outbound webhook signing support (`X-Laser-*` HMAC headers).
+- Built-in metrics endpoint with ingestion lag gauge (`ingester_ingestion_lag_ms`).
 
 ### Go API (`api/`)
 
-- Fiber API with structured runtime config.
-- PostgreSQL-backed IDL CRUD endpoints:
-  - `POST /api/idls`
-  - `GET /api/idls`
-  - `GET /api/idls/:programID`
-  - `PUT /api/idls/:programID`
-  - `DELETE /api/idls/:programID`
-- ClickHouse-backed historical endpoint:
-  - `GET /api/events?program_id=...&event_type=...&from=...&to=...&limit=...&offset=...`
-- Agent intelligence endpoints:
-  - `POST /api/agent/query` (NL prompt -> guarded SQL with `mode=sql|verified|analyst_report`)
-    - verified execution responses now include `evidence_bundle` with `sql_hash_sha256`, `program_ids`, `signatures`, and `slots`
-  - `POST /api/agent/query/report` (dedicated strict verified analyst report alias)
-  - `POST /api/agent/backtest/launches` (coin launch backtesting with signal scoring)
-  - `POST /api/agent/backtest/launches/score` (backtest-to-live launch scoring with probability band + confidence)
-  - `POST /api/agent/automations` (create threshold-based agent monitor)
+- IDL CRUD endpoints backed by PostgreSQL.
+- Historical query endpoint backed by ClickHouse.
+- Agent query endpoints:
+  - `POST /api/agent/query`
+  - `POST /api/agent/query/report`
+- Query responses include verified evidence bundles (`sql_hash_sha256`, `program_ids`, `signatures`, `slots`).
+- Backtesting endpoints:
+  - `POST /api/agent/backtest/launches`
+  - `POST /api/agent/backtest/launches/score`
+- Automation endpoints:
+  - `POST /api/agent/automations`
   - `GET /api/agent/automations`
-  - `GET /api/agent/automations/:id/audit` (evaluation audit trail)
+  - `GET /api/agent/automations/:id/audit`
   - `PATCH /api/agent/automations/:id`
   - `POST /api/agent/automations/:id/evaluate`
-- Health and readiness endpoints:
-  - `GET /api/health`
-  - `GET /api/ready` (DB + Redis checks, plus ClickHouse when configured)
-- WebSocket event fanout:
-  - `GET /ws?program_id=...&event_type=...`
-  - `GET /ws/:programID?event_type=...`
-- Dragonfly/Redis PubSub integration through a native RESP client.
-- Slow-client protection via bounded per-connection queue and forced disconnect on overflow.
-- AuthN/AuthZ:
-  - API key auth (`X-API-Key`) and JWT HS256 auth (`Authorization: Bearer ...`)
-  - Role separation (`read` vs `admin`)
-  - Program-level access control for IDL/event/ws requests
-- Abuse protection:
-  - Fixed-window per-IP rate limits on `/api/events` and websocket upgrades
-  - WebSocket capacity limits (global + per-IP)
-- Observability:
-  - Request/WS metrics exposed at `GET /metrics` (Prometheus text format)
-  - Request IDs enabled via middleware
+- Automation safety rails:
+  - cooldown (`cooldown_minutes`)
+  - dedupe (`dedupe_minutes`)
+  - retry policy (`retry_max_attempts`, `retry_initial_backoff_ms`)
+  - dry-run mode (`dry_run`)
+- Inbound signed webhook receiver with replay protection:
+  - `POST /api/agent/webhooks/inbound`
+  - `GET /api/agent/webhooks/inbound`
+- Explicit versioned DB migrations + schema verification at startup.
 
 ## Environment Setup
 
-Copy:
+Copy and configure:
 
 - `api/.env.example` -> `api/.env`
 - `ingester/.env.example` -> `ingester/.env`
 
-and fill in real values.
-
 ## Run
 
-### 1) API
+### API
 
 ```bash
-cd /api
+cd api
 go run .
 ```
 
-
-### 2) Ingester
+### Ingester
 
 ```bash
 cd ingester
 cargo run
 ```
 
-### 3) Interactive CLI (configure/use/monitor)
+### Interactive CLI
 
 ```bash
 ./laserctl hub
 ```
 
-Examples:
+## DB Migration Commands
 
 ```bash
-./laserctl hub
-./laserctl configure
-./laserctl health
-./laserctl query-report "What changed in Program X over the last 24h?"
-./laserctl backtest
-./laserctl custom
+cd api
+./scripts/db_migrate.sh
+./scripts/db_rollback_last.sh
+# or:
+go run ./cmd/dbmigrate up
+go run ./cmd/dbmigrate down
+go run ./cmd/dbmigrate verify
 ```
 
-CI gate is defined in `.github/workflows/ci.yml` and runs:
-- Go E2E suite (`TestAPIEndToEndFlow`)
-- full Go tests
+## Validation
+
+```bash
+cd api
+GOCACHE=/tmp/go-build go test ./...
+
+cd ../ingester
+cargo test --locked
+```
+
+## CI
+
+CI workflow: `.github/workflows/ci.yml`
+
+It runs:
+
+- API E2E tests
+- Full Go test suite
+- Service-backed Go integration tests (Postgres + Redis + ClickHouse)
 - Rust tests
+
+## Observability Artifacts
+
+- Prometheus alert rules: `ops/prometheus/laserstream-slo-alerts.yml`
+- Grafana dashboard: `ops/grafana/laserstream-slo-dashboard.json`
+
+## API Contract + SDK
+
+- OpenAPI spec: `api/openapi/laserstream-agent-api.yaml`
+- Typed TypeScript SDK: `sdk/typescript`

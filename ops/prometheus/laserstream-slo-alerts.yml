@@ -1,0 +1,43 @@
+groups:
+  - name: laserstream-slo-alerts
+    interval: 30s
+    rules:
+      - alert: LaserStreamIngestionLagHigh
+        expr: ingester_ingestion_lag_ms > 120000
+        for: 10m
+        labels:
+          severity: critical
+          service: ingester
+        annotations:
+          summary: "Ingestion lag is high"
+          description: "ingester_ingestion_lag_ms has been above 120000ms for at least 10 minutes."
+
+      - alert: LaserStreamAgentQueryErrorRateHigh
+        expr: |
+          (
+            sum(increase(api_agent_query_errors_total[5m]))
+            /
+            clamp_min(sum(increase(api_agent_query_executions_total[5m])), 1)
+          ) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          service: api
+        annotations:
+          summary: "Agent query error rate is elevated"
+          description: "More than 5% of agent queries are failing over the last 5 minutes."
+
+      - alert: LaserStreamAutomationFailureRateHigh
+        expr: |
+          (
+            sum(increase(api_agent_automation_failures_total[10m]))
+            /
+            clamp_min(sum(increase(api_agent_automation_evaluations_total[10m])), 1)
+          ) > 0.10
+        for: 15m
+        labels:
+          severity: warning
+          service: api
+        annotations:
+          summary: "Automation failure rate is elevated"
+          description: "More than 10% of automation evaluations are failing over the last 10 minutes."

@@ -28,6 +28,68 @@ jobs:
       - name: Run full Go test suite
         run: go test ./...
 
+  api-services-integration:
+    name: API (Service Integration)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_DB: laserstream
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d laserstream"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+      clickhouse:
+        image: clickhouse/clickhouse-server:24.8
+        ports:
+          - 8123:8123
+    defaults:
+      run:
+        working-directory: api
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+
+      - name: Wait for ClickHouse
+        run: |
+          for i in {1..30}; do
+            if curl -fsS http://127.0.0.1:8123/ping >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "ClickHouse did not become ready in time"
+          exit 1
+
+      - name: Run production-like service integration tests
+        env:
+          INTEGRATION_TEST_SERVICES: "1"
+          TEST_POSTGRES_HOST: "127.0.0.1"
+          TEST_POSTGRES_PORT: "5432"
+          TEST_POSTGRES_USER: "postgres"
+          TEST_POSTGRES_PASSWORD: "postgres"
+          TEST_POSTGRES_DB: "laserstream"
+          TEST_POSTGRES_SSLMODE: "disable"
+          TEST_REDIS_ADDR: "127.0.0.1:6379"
+          TEST_CLICKHOUSE_HTTP_URL: "http://127.0.0.1:8123"
+          TEST_CLICKHOUSE_DATABASE: "default"
+        run: go test ./integration -count=1 -v
+
   ingester-tests:
     name: Ingester (Rust)
     runs-on: ubuntu-latest

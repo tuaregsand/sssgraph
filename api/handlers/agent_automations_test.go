@@ -3,6 +3,7 @@ package handlers
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -142,8 +143,25 @@ func TestAutomationDedupeKeyStable(t *testing.T) {
 }
 
 func TestSendAutomationWebhookWithRetry(t *testing.T) {
+	t.Setenv("WEBHOOK_SIGNING_ENABLED", "true")
+	t.Setenv("WEBHOOK_SIGNING_SECRET", "test-webhook-secret")
+	t.Setenv("WEBHOOK_SIGNING_KEY_ID", "test-key")
+
 	var attempts int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := strings.TrimSpace(r.Header.Get(webhookSignatureVersionHeader)); got == "" {
+			t.Fatalf("expected webhook signature header to be set")
+		}
+		if got := strings.TrimSpace(r.Header.Get(webhookTimestampHeader)); got == "" {
+			t.Fatalf("expected webhook timestamp header to be set")
+		}
+		if got := strings.TrimSpace(r.Header.Get(webhookNonceHeader)); got == "" {
+			t.Fatalf("expected webhook nonce header to be set")
+		}
+		if got := strings.TrimSpace(r.Header.Get(webhookKeyIDHeader)); got != "test-key" {
+			t.Fatalf("expected key id header test-key, got %q", got)
+		}
+
 		current := atomic.AddInt32(&attempts, 1)
 		if current < 3 {
 			w.WriteHeader(http.StatusTooManyRequests)
@@ -184,5 +202,14 @@ func TestSendAutomationWebhookWithRetry(t *testing.T) {
 	}
 	if atomic.LoadInt32(&attempts) != 3 {
 		t.Fatalf("expected server to receive 3 attempts, got %d", attempts)
+	}
+}
+
+func TestFormatIntervalLiteral(t *testing.T) {
+	if got := formatIntervalLiteral(0); got != "" {
+		t.Fatalf("expected empty interval for zero duration, got %q", got)
+	}
+	if got := formatIntervalLiteral(90 * time.Second); got != "90 seconds" {
+		t.Fatalf("expected 90 second interval literal, got %q", got)
 	}
 }

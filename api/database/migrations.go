@@ -197,6 +197,21 @@ func VerifySchema(db *gorm.DB) error {
 			"error",
 			"created_at",
 		},
+		"webhook_replay_nonces": {
+			"nonce",
+			"received_at",
+			"expires_at",
+		},
+		"agent_inbound_webhooks": {
+			"id",
+			"nonce",
+			"signature",
+			"key_id",
+			"source_ip",
+			"payload",
+			"received_at",
+			"created_at",
+		},
 	}
 
 	requiredIndexes := map[string][]string{
@@ -214,6 +229,13 @@ func VerifySchema(db *gorm.DB) error {
 			"idx_agent_automation_evaluations_automation_id",
 			"idx_agent_automation_evaluations_evaluated_at",
 			"idx_agent_automation_evaluations_automation_eval",
+		},
+		"webhook_replay_nonces": {
+			"idx_webhook_replay_nonces_expires_at",
+		},
+		"agent_inbound_webhooks": {
+			"idx_agent_inbound_webhooks_nonce",
+			"idx_agent_inbound_webhooks_received_at",
 		},
 	}
 

@@ -88,6 +88,16 @@ func main() {
 		log.Println("Agent automation runner started")
 	}
 
+	var automationRetentionRunner *handlers.AgentAutomationRetentionRunner
+	if cfg.Agent.AuditRetentionEnabled {
+		automationRetentionRunner = handlers.NewAgentAutomationRetentionRunner(
+			cfg.Agent.AuditCleanupInterval,
+			cfg.Agent.AuditRetention,
+		)
+		automationRetentionRunner.Start()
+		log.Println("Agent automation retention runner started")
+	}
+
 	app := fiber.New()
 	app.Use(requestid.New())
 	app.Use(logger.New())
@@ -100,13 +110,18 @@ func main() {
 		WSUpgradeRateLimiter: wsLimiter,
 	})
 
-	go handleShutdown(app, wsManager, automationRunner)
+	go handleShutdown(app, wsManager, automationRunner, automationRetentionRunner)
 
 	log.Printf("API listening on :%s", cfg.Port)
 	log.Fatal(app.Listen(":" + cfg.Port))
 }
 
-func handleShutdown(app *fiber.App, wsManager *stream.Manager, automationRunner *handlers.AgentAutomationRunner) {
+func handleShutdown(
+	app *fiber.App,
+	wsManager *stream.Manager,
+	automationRunner *handlers.AgentAutomationRunner,
+	automationRetentionRunner *handlers.AgentAutomationRetentionRunner,
+) {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
@@ -114,6 +129,9 @@ func handleShutdown(app *fiber.App, wsManager *stream.Manager, automationRunner 
 	log.Println("Shutting down API service...")
 	if automationRunner != nil {
 		automationRunner.Stop()
+	}
+	if automationRetentionRunner != nil {
+		automationRetentionRunner.Stop()
 	}
 	wsManager.Close()
 

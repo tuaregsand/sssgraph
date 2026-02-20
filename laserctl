@@ -1,0 +1,783 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_FILE="${LASERCTL_CONFIG:-$HOME/.laserctl.env}"
+LOG_FILE="${LASERCTL_LOG_FILE:-/tmp/laserctl-events.log}"
+API_LOG_FILE="${LASERCTL_API_LOG_FILE:-}"
+INGESTER_LOG_FILE="${LASERCTL_INGESTER_LOG_FILE:-}"
+DEFAULT_API_URL="http://127.0.0.1:3000"
+
+API_URL=""
+API_KEY=""
+
+HAS_JQ=0
+HAS_TPUT=0
+IS_TTY=0
+API_LAST_STATUS="000"
+API_LAST_ERROR=""
+
+RST=""
+BOLD=""
+DIM=""
+FG_PRIMARY=""
+FG_MUTED=""
+FG_SUCCESS=""
+FG_WARN=""
+FG_ERROR=""
+FG_ACCENT=""
+
+ACTIONS=(
+  "Configure API URL/API key"
+  "Health/Ready"
+  "Query strict analyst report"
+  "Query verified"
+  "Backtest launches"
+  "List webhooks"
+  "Create webhook"
+  "List automations"
+  "Create automation"
+  "Evaluate automation"
+  "Custom API request"
+  "Show config status"
+)
+
+init_runtime() {
+  if [[ -t 1 ]]; then
+    IS_TTY=1
+  fi
+  if command -v jq >/dev/null 2>&1; then
+    HAS_JQ=1
+  fi
+  if command -v tput >/dev/null 2>&1; then
+    HAS_TPUT=1
+  fi
+
+  if [[ "$IS_TTY" -eq 1 && "$HAS_TPUT" -eq 1 ]]; then
+    local colors
+    colors="$(tput colors 2>/dev/null || echo 0)"
+    if [[ "${colors:-0}" -ge 8 ]]; then
+      RST="$(tput sgr0)"
+      BOLD="$(tput bold)"
+      DIM="$(tput dim)"
+      FG_PRIMARY="$(tput setaf 6)"
+      FG_MUTED="$(tput setaf 7)"
+      FG_SUCCESS="$(tput setaf 2)"
+      FG_WARN="$(tput setaf 3)"
+      FG_ERROR="$(tput setaf 1)"
+      FG_ACCENT="$(tput setaf 4)"
+    fi
+  fi
+
+  touch "$LOG_FILE" >/dev/null 2>&1 || true
+}
+
+log_event() {
+  local level="$1"
+  local message="$2"
+  printf '%s [%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$level" "$message" >>"$LOG_FILE" 2>/dev/null || true
+}
+
+cprint() {
+  local color="$1"
+  shift
+  printf '%b%s%b\n' "$color" "$*" "$RST"
+}
+
+term_cols() {
+  local cols="100"
+  if [[ "$HAS_TPUT" -eq 1 ]]; then
+    cols="$(tput cols 2>/dev/null || echo 100)"
+  fi
+  if [[ -z "$cols" || "$cols" -lt 80 ]]; then
+    cols=80
+  fi
+  printf '%s' "$cols"
+}
+
+repeat_char() {
+  local char="$1"
+  local count="$2"
+  if [[ "$count" -le 0 ]]; then
+    printf ''
+    return
+  fi
+  printf "%${count}s" "" | tr ' ' "$char"
+}
+
+fit_text() {
+  local text="$1"
+  local width="$2"
+  local clean
+  clean="$(printf '%s' "$text" | tr '\t' ' ')"
+  if [[ "${#clean}" -gt "$width" ]]; then
+    if [[ "$width" -gt 3 ]]; then
+      clean="${clean:0:$((width - 3))}..."
+    else
+      clean="${clean:0:$width}"
+    fi
+  fi
+  printf "%-${width}s" "$clean"
+}
+
+line() {
+  local cols
+  cols="$(term_cols)"
+  printf '%s\n' "$(repeat_char "-" "$cols")"
+}
+
+title() {
+  local cols
+  cols="$(term_cols)"
+  local rule
+  rule="$(repeat_char "=" "$cols")"
+  cprint "${FG_MUTED}" "$rule"
+  cprint "${BOLD}${FG_PRIMARY}" "LASERSTREAM :: CONTROL PLANE"
+  cprint "${DIM}${FG_MUTED}" "single-command mode | API ${API_URL} | UTC $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  cprint "${FG_MUTED}" "$rule"
+}
+
+section() {
+  cprint "${BOLD}${FG_ACCENT}" "$*"
+}
+
+clear_screen() {
+  if [[ "$IS_TTY" -eq 1 ]]; then
+    clear
+  fi
+}
+
+pause_screen() {
+  if [[ "$IS_TTY" -eq 1 ]]; then
+    read -r -p "Press Enter to continue... " _
+  fi
+}
+
+status_color() {
+  local status="$1"
+  if [[ "$status" =~ ^2[0-9][0-9]$ ]]; then
+    printf '%s' "${FG_SUCCESS}"
+  elif [[ "$status" =~ ^4[0-9][0-9]$ ]]; then
+    printf '%s' "${FG_WARN}"
+  else
+    printf '%s' "${FG_ERROR}"
+  fi
+}
+
+status_badge() {
+  local status="$1"
+  if [[ "$status" =~ ^2[0-9][0-9]$ ]]; then
+    printf '%s' "OK"
+  elif [[ "$status" =~ ^4[0-9][0-9]$ ]]; then
+    printf '%s' "WARN"
+  else
+    printf '%s' "ERR"
+  fi
+}
+
+load_config() {
+  if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+  fi
+  API_URL="${API_URL:-$DEFAULT_API_URL}"
+  API_KEY="${API_KEY:-}"
+}
+
+save_config() {
+  mkdir -p "$(dirname "$CONFIG_FILE")"
+  cat >"$CONFIG_FILE" <<EOF
+API_URL="$API_URL"
+API_KEY="$API_KEY"
+EOF
+  cprint "${FG_SUCCESS}" "Saved config to $CONFIG_FILE"
+  log_event "INFO" "Updated configuration"
+}
+
+json_escape() {
+  local value="${1:-}"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\n'/\\n}"
+  value="${value//$'\r'/}"
+  printf '%s' "$value"
+}
+
+pretty_print() {
+  if [[ "$HAS_JQ" -eq 1 ]]; then
+    jq . 2>/dev/null || cat
+  else
+    cat
+  fi
+}
+
+json_query() {
+  local json="$1"
+  local expr="$2"
+  if [[ "$HAS_JQ" -eq 1 ]]; then
+    printf '%s' "$json" | jq -r "$expr // empty" 2>/dev/null || true
+  fi
+}
+
+api_fetch() {
+  local method="$1"
+  local path="$2"
+  local body="${3:-}"
+  local url="${API_URL%/}${path}"
+  local tmp
+  local tmp_err
+  local status
+  local rc
+  tmp="$(mktemp)"
+  tmp_err="$(mktemp)"
+
+  local -a headers
+  headers=(-H "Accept: application/json")
+  if [[ -n "$API_KEY" ]]; then
+    headers+=(-H "X-API-Key: $API_KEY")
+  fi
+
+  API_LAST_ERROR=""
+  if [[ -n "$body" ]]; then
+    headers+=(-H "Content-Type: application/json")
+    set +e
+    status="$(curl -sS -o "$tmp" -w "%{http_code}" -X "$method" "$url" "${headers[@]}" --data "$body" 2>"$tmp_err")"
+    rc=$?
+    set -e
+  else
+    set +e
+    status="$(curl -sS -o "$tmp" -w "%{http_code}" -X "$method" "$url" "${headers[@]}" 2>"$tmp_err")"
+    rc=$?
+    set -e
+  fi
+
+  if [[ "$rc" -ne 0 ]]; then
+    API_LAST_STATUS="000"
+    API_LAST_ERROR="$(tail -n 1 "$tmp_err" | sed 's/^curl: //')"
+    if [[ -z "$API_LAST_ERROR" ]]; then
+      API_LAST_ERROR="Failed to reach API for ${method} ${path}"
+    fi
+    log_event "ERROR" "${API_LAST_ERROR}"
+    rm -f "$tmp_err"
+    rm -f "$tmp"
+    printf '%s' "{}"
+    return 0
+  fi
+
+  API_LAST_STATUS="$status"
+  log_event "HTTP" "${status} ${method} ${path}"
+  rm -f "$tmp_err"
+  cat "$tmp"
+  rm -f "$tmp"
+}
+
+api_request() {
+  local method="$1"
+  local path="$2"
+  local body="${3:-}"
+  local response
+  response="$(api_fetch "$method" "$path" "$body")"
+  local color
+  color="$(status_color "$API_LAST_STATUS")"
+  cprint "${BOLD}${color}" "HTTP ${API_LAST_STATUS} ${method} ${path}"
+  if [[ -n "$API_LAST_ERROR" ]]; then
+    cprint "${FG_ERROR}" "$API_LAST_ERROR"
+  fi
+  printf '%s\n' "$response" | pretty_print
+}
+
+prompt_with_default() {
+  local label="$1"
+  local current="$2"
+  local value
+  read -r -p "$label [$current]: " value
+  if [[ -z "$value" ]]; then
+    value="$current"
+  fi
+  printf '%s' "$value"
+}
+
+configure_cmd() {
+  clear_screen
+  title
+  section "Configure CLI"
+  API_URL="$(prompt_with_default "API URL" "$API_URL")"
+  read -r -p "API key (leave empty to keep current): " new_key
+  if [[ -n "$new_key" ]]; then
+    API_KEY="$new_key"
+  fi
+  save_config
+}
+
+health_cmd() {
+  clear_screen
+  title
+  section "Health"
+  api_request GET "/api/health"
+  echo
+  api_request GET "/api/ready"
+}
+
+query_report_cmd() {
+  local prompt="${1:-}"
+  local limit="${2:-100}"
+
+  clear_screen
+  title
+  section "Strict Analyst Report"
+  if [[ -z "$prompt" ]]; then
+    read -r -p "Question: " prompt
+  fi
+  read -r -p "Limit [$limit]: " input_limit
+  if [[ -n "${input_limit:-}" ]]; then
+    limit="$input_limit"
+  fi
+
+  local escaped_prompt
+  escaped_prompt="$(json_escape "$prompt")"
+  local body
+  body="{\"prompt\":\"$escaped_prompt\",\"limit\":$limit}"
+  api_request POST "/api/agent/query/report" "$body"
+}
+
+query_verified_cmd() {
+  local prompt="${1:-}"
+  local limit="${2:-100}"
+
+  clear_screen
+  title
+  section "Verified Query"
+  if [[ -z "$prompt" ]]; then
+    read -r -p "Question: " prompt
+  fi
+  read -r -p "Limit [$limit]: " input_limit
+  if [[ -n "${input_limit:-}" ]]; then
+    limit="$input_limit"
+  fi
+
+  local escaped_prompt
+  escaped_prompt="$(json_escape "$prompt")"
+  local body
+  body="{\"prompt\":\"$escaped_prompt\",\"mode\":\"verified\",\"limit\":$limit}"
+  api_request POST "/api/agent/query" "$body"
+}
+
+backtest_launches_cmd() {
+  local name
+  local program_id
+  local launch_at
+  local baseline_hours="24"
+  local evaluation_hours="6"
+  local min_events="100"
+
+  clear_screen
+  title
+  section "Launch Backtest"
+  read -r -p "Launch name: " name
+  read -r -p "Program ID (base58): " program_id
+  read -r -p "Launch timestamp RFC3339: " launch_at
+  read -r -p "Baseline hours [$baseline_hours]: " input_baseline
+  read -r -p "Evaluation hours [$evaluation_hours]: " input_eval
+  read -r -p "Min evaluation events [$min_events]: " input_min_events
+  if [[ -n "${input_baseline:-}" ]]; then baseline_hours="$input_baseline"; fi
+  if [[ -n "${input_eval:-}" ]]; then evaluation_hours="$input_eval"; fi
+  if [[ -n "${input_min_events:-}" ]]; then min_events="$input_min_events"; fi
+
+  local body
+  body=$(
+    cat <<EOF
+{
+  "baseline_hours": $baseline_hours,
+  "evaluation_hours": $evaluation_hours,
+  "min_evaluation_events": $min_events,
+  "launches": [{
+    "name": "$(json_escape "$name")",
+    "program_id": "$(json_escape "$program_id")",
+    "launch_at": "$(json_escape "$launch_at")"
+  }]
+}
+EOF
+  )
+  api_request POST "/api/agent/backtest/launches" "$body"
+}
+
+list_webhooks_cmd() {
+  clear_screen
+  title
+  section "Agent Webhooks"
+  api_request GET "/api/agent/webhooks"
+}
+
+create_webhook_cmd() {
+  local url
+  local program_id
+  local event_type
+  clear_screen
+  title
+  section "Create Webhook"
+  read -r -p "Webhook URL: " url
+  read -r -p "Program ID (blank for all): " program_id
+  read -r -p "Event type (blank for all): " event_type
+  local body
+  body="{\"url\":\"$(json_escape "$url")\",\"program_id\":\"$(json_escape "$program_id")\",\"event_type\":\"$(json_escape "$event_type")\"}"
+  api_request POST "/api/agent/webhooks" "$body"
+}
+
+list_automations_cmd() {
+  clear_screen
+  title
+  section "Automations"
+  api_request GET "/api/agent/automations"
+}
+
+create_automation_cmd() {
+  local name
+  local description
+  local program_id
+  local comparator="lt"
+  local threshold="1000"
+  local schedule_minutes="60"
+  local window_minutes="1440"
+  local cooldown_minutes="120"
+  local webhook_url
+  local query_template
+
+  clear_screen
+  title
+  section "Create Automation"
+  read -r -p "Automation name: " name
+  read -r -p "Description: " description
+  read -r -p "Program ID: " program_id
+  read -r -p "Comparator [lt|lte|gt|gte] [$comparator]: " input_comp
+  read -r -p "Threshold [$threshold]: " input_thr
+  read -r -p "Schedule minutes [$schedule_minutes]: " input_sched
+  read -r -p "Window minutes [$window_minutes]: " input_window
+  read -r -p "Cooldown minutes [$cooldown_minutes]: " input_cooldown
+  read -r -p "Webhook URL: " webhook_url
+  read -r -p "Query template: " query_template
+  if [[ -n "${input_comp:-}" ]]; then comparator="$input_comp"; fi
+  if [[ -n "${input_thr:-}" ]]; then threshold="$input_thr"; fi
+  if [[ -n "${input_sched:-}" ]]; then schedule_minutes="$input_sched"; fi
+  if [[ -n "${input_window:-}" ]]; then window_minutes="$input_window"; fi
+  if [[ -n "${input_cooldown:-}" ]]; then cooldown_minutes="$input_cooldown"; fi
+
+  local body
+  body=$(
+    cat <<EOF
+{
+  "name": "$(json_escape "$name")",
+  "description": "$(json_escape "$description")",
+  "program_id": "$(json_escape "$program_id")",
+  "query_template": "$(json_escape "$query_template")",
+  "comparator": "$(json_escape "$comparator")",
+  "threshold": $threshold,
+  "schedule_minutes": $schedule_minutes,
+  "window_minutes": $window_minutes,
+  "cooldown_minutes": $cooldown_minutes,
+  "webhook_url": "$(json_escape "$webhook_url")",
+  "is_active": true
+}
+EOF
+  )
+  api_request POST "/api/agent/automations" "$body"
+}
+
+evaluate_automation_cmd() {
+  local id
+  clear_screen
+  title
+  section "Evaluate Automation"
+  read -r -p "Automation ID: " id
+  api_request POST "/api/agent/automations/${id}/evaluate"
+}
+
+custom_request_cmd() {
+  local method
+  local path
+  local body
+  clear_screen
+  title
+  section "Custom API Request"
+  read -r -p "Method [GET|POST|PATCH|PUT|DELETE]: " method
+  read -r -p "Path (e.g. /api/health): " path
+  read -r -p "JSON body (blank for none): " body
+  method="$(printf '%s' "$method" | tr '[:lower:]' '[:upper:]')"
+  api_request "$method" "$path" "$body"
+}
+
+print_status_cmd() {
+  clear_screen
+  title
+  section "Configuration"
+  printf 'API_URL: %s\n' "$API_URL"
+  if [[ -n "$API_KEY" ]]; then
+    printf 'API_KEY: %s\n' "***set***"
+  else
+    printf 'API_KEY: %s\n' "<empty>"
+  fi
+  printf 'Config file: %s\n' "$CONFIG_FILE"
+  printf 'Hub log file: %s\n' "$LOG_FILE"
+}
+
+metric_value() {
+  local metrics="$1"
+  local key="$2"
+  printf '%s\n' "$metrics" | awk -v k="$key" '$1==k {print $2}' | tail -n 1
+}
+
+dashboard_snapshot() {
+  local health_json ready_json hooks_json autos_json metrics
+  local hs rs hks aus ms
+  local health_state ready_state hooks_count autos_count
+  local ws_current ws_out ws_rejected ws_slow
+
+  health_json="$(api_fetch GET "/api/health")"; hs="$API_LAST_STATUS"
+  ready_json="$(api_fetch GET "/api/ready")"; rs="$API_LAST_STATUS"
+  hooks_json="$(api_fetch GET "/api/agent/webhooks")"; hks="$API_LAST_STATUS"
+  autos_json="$(api_fetch GET "/api/agent/automations")"; aus="$API_LAST_STATUS"
+  metrics="$(api_fetch GET "/metrics")"; ms="$API_LAST_STATUS"
+
+  health_state="$(json_query "$health_json" '.status')"
+  ready_state="$(json_query "$ready_json" '.status')"
+  hooks_count="$(json_query "$hooks_json" 'length')"
+  autos_count="$(json_query "$autos_json" '.count // (.items | length)')"
+  ws_current="$(metric_value "$metrics" "api_ws_current_connections")"
+  ws_out="$(metric_value "$metrics" "api_ws_messages_out_total")"
+  ws_rejected="$(metric_value "$metrics" "api_ws_rejected_connections_total")"
+  ws_slow="$(metric_value "$metrics" "api_ws_slow_client_drops_total")"
+
+  [[ -n "$health_state" ]] || health_state="unknown"
+  [[ -n "$ready_state" ]] || ready_state="unknown"
+  [[ -n "$hooks_count" ]] || hooks_count="?"
+  [[ -n "$autos_count" ]] || autos_count="?"
+  [[ -n "$ws_current" ]] || ws_current="?"
+  [[ -n "$ws_out" ]] || ws_out="?"
+  [[ -n "$ws_rejected" ]] || ws_rejected="?"
+  [[ -n "$ws_slow" ]] || ws_slow="?"
+
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+    "$health_state" "$hs" "$ready_state" "$rs" "$hooks_count" "$hks" "$autos_count" "$aus" \
+    "$ws_current" "$ws_out" "$ws_rejected" "$ws_slow"
+}
+
+draw_hub() {
+  local selected="$1"
+  local snapshot
+  local health_state hs ready_state rs hooks_count hks autos_count aus ws_current ws_out ws_rejected ws_slow
+  snapshot="$(dashboard_snapshot)"
+  IFS='|' read -r health_state hs ready_state rs hooks_count hks autos_count aus ws_current ws_out ws_rejected ws_slow <<<"$snapshot"
+
+  local health_badge ready_badge hooks_badge autos_badge
+  health_badge="$(status_badge "$hs")"
+  ready_badge="$(status_badge "$rs")"
+  hooks_badge="$(status_badge "$hks")"
+  autos_badge="$(status_badge "$aus")"
+
+  local cols left_width right_width
+  cols="$(term_cols)"
+  left_width=41
+  right_width=$((cols - left_width - 7))
+  if [[ "$right_width" -lt 34 ]]; then
+    right_width=34
+    left_width=$((cols - right_width - 7))
+  fi
+  if [[ "$left_width" -lt 30 ]]; then
+    left_width=30
+  fi
+
+  local -a left_lines right_lines
+  local i
+  left_lines+=(" ACTION RAIL")
+  for ((i = 0; i < ${#ACTIONS[@]}; i++)); do
+    left_lines+=(" $(printf '%02d' $((i + 1)))  ${ACTIONS[$i]}")
+  done
+  left_lines+=("" " /    Custom API request" " r    Refresh" " q    Quit")
+
+  right_lines+=(" LIVE TELEMETRY")
+  right_lines+=(" health ............ ${health_state} (${health_badge} ${hs})")
+  right_lines+=(" readiness ......... ${ready_state} (${ready_badge} ${rs})")
+  right_lines+=(" webhooks .......... ${hooks_count} (${hooks_badge} ${hks})")
+  right_lines+=(" automations ....... ${autos_count} (${autos_badge} ${aus})")
+  right_lines+=(" ws connections .... ${ws_current}")
+  right_lines+=(" ws msgs out ....... ${ws_out}")
+  right_lines+=(" ws rejected ....... ${ws_rejected}")
+  right_lines+=(" ws slow drops ..... ${ws_slow}")
+  right_lines+=("" " ACTIVITY LOG")
+
+  while IFS= read -r log_line; do
+    right_lines+=(" $log_line")
+  done < <(tail -n 8 "$LOG_FILE" 2>/dev/null || true)
+
+  if [[ -n "$API_LOG_FILE" && -f "$API_LOG_FILE" ]]; then
+    right_lines+=("" " API LOG TAIL")
+    while IFS= read -r api_log_line; do
+      right_lines+=(" $api_log_line")
+    done < <(tail -n 4 "$API_LOG_FILE" 2>/dev/null || true)
+  fi
+
+  if [[ -n "$INGESTER_LOG_FILE" && -f "$INGESTER_LOG_FILE" ]]; then
+    right_lines+=("" " INGESTER LOG TAIL")
+    while IFS= read -r ing_log_line; do
+      right_lines+=(" $ing_log_line")
+    done < <(tail -n 4 "$INGESTER_LOG_FILE" 2>/dev/null || true)
+  fi
+
+  if [[ "$hs" == "000" ]]; then
+    right_lines+=("" " API CONNECTION")
+    right_lines+=(" unable to reach ${API_URL}")
+    right_lines+=(" run action: Configure API URL/API key")
+    right_lines+=(" ensure service is running: cd api && go run .")
+  fi
+
+  local total_rows="${#left_lines[@]}"
+  if [[ "${#right_lines[@]}" -gt "$total_rows" ]]; then
+    total_rows="${#right_lines[@]}"
+  fi
+
+  clear_screen
+  title
+
+  printf '+%s+ +%s+\n' "$(repeat_char "-" "$left_width")" "$(repeat_char "-" "$right_width")"
+  for ((i = 0; i < total_rows; i++)); do
+    local left_raw right_raw left_cell right_cell
+    left_raw="${left_lines[$i]:-}"
+    right_raw="${right_lines[$i]:-}"
+    left_cell="$(fit_text "$left_raw" "$left_width")"
+    right_cell="$(fit_text "$right_raw" "$right_width")"
+
+    if [[ "$i" -ge 1 && "$i" -le "${#ACTIONS[@]}" && "$((i - 1))" -eq "$selected" ]]; then
+      printf '|%b%s%b| |%s|\n' "${BOLD}${FG_SUCCESS}" "$left_cell" "$RST" "$right_cell"
+    else
+      printf '|%s| |%s|\n' "$left_cell" "$right_cell"
+    fi
+  done
+  printf '+%s+ +%s+\n' "$(repeat_char "-" "$left_width")" "$(repeat_char "-" "$right_width")"
+  cprint "${DIM}${FG_MUTED}" "Controls: Up/Down (or j/k), Enter run action, r refresh, q quit, / custom request"
+}
+
+run_action_by_index() {
+  local idx="$1"
+  case "$idx" in
+    0) configure_cmd ;;
+    1) health_cmd ;;
+    2) query_report_cmd ;;
+    3) query_verified_cmd ;;
+    4) backtest_launches_cmd ;;
+    5) list_webhooks_cmd ;;
+    6) create_webhook_cmd ;;
+    7) list_automations_cmd ;;
+    8) create_automation_cmd ;;
+    9) evaluate_automation_cmd ;;
+    10) custom_request_cmd ;;
+    11) print_status_cmd ;;
+    *) return ;;
+  esac
+  pause_screen
+}
+
+read_key() {
+  local timeout="${1:-1}"
+  local key=""
+  IFS= read -r -s -n 1 -t "$timeout" key || true
+  if [[ "$key" == $'\x1b' ]]; then
+    local rest=""
+    IFS= read -r -s -n 2 -t 0.02 rest || true
+    key+="$rest"
+  fi
+  printf '%s' "$key"
+}
+
+run_hub() {
+  local selected=0
+  local max_index=$(( ${#ACTIONS[@]} - 1 ))
+  while true; do
+    draw_hub "$selected"
+    local key
+    key="$(read_key 1)"
+    case "$key" in
+      $'\x1b[A'|k|K)
+        if [[ "$selected" -gt 0 ]]; then selected=$((selected - 1)); fi
+        ;;
+      $'\x1b[B'|j|J)
+        if [[ "$selected" -lt "$max_index" ]]; then selected=$((selected + 1)); fi
+        ;;
+      $'\n'|$'\r')
+        run_action_by_index "$selected"
+        ;;
+      /)
+        custom_request_cmd
+        pause_screen
+        ;;
+      r|R|"")
+        ;;
+      q|Q)
+        break
+        ;;
+      *)
+        ;;
+    esac
+  done
+}
+
+show_help() {
+  cat <<'EOF'
+laserctl - LaserStream interactive terminal command center
+
+Main entry:
+  ./laserctl hub            # full-screen mode, do everything from one place
+  ./laserctl                # same as `hub`
+
+Other commands:
+  ./laserctl configure
+  ./laserctl status
+  ./laserctl health
+  ./laserctl dashboard
+  ./laserctl query-report "question" [limit]
+  ./laserctl query-verified "question" [limit]
+  ./laserctl backtest
+  ./laserctl list-webhooks
+  ./laserctl create-webhook
+  ./laserctl list-automations
+  ./laserctl create-automation
+  ./laserctl eval-automation
+  ./laserctl custom
+  ./laserctl help
+
+Optional environment variables:
+  LASERCTL_CONFIG=/path/to/config.env
+  LASERCTL_LOG_FILE=/path/to/hub.log
+  LASERCTL_API_LOG_FILE=/path/to/api-service.log
+  LASERCTL_INGESTER_LOG_FILE=/path/to/ingester.log
+EOF
+}
+
+main() {
+  init_runtime
+  load_config
+
+  local cmd="${1:-hub}"
+  shift || true
+
+  case "$cmd" in
+    hub|dashboard|interactive|menu) run_hub ;;
+    configure) configure_cmd ;;
+    status) print_status_cmd ;;
+    health) health_cmd ;;
+    query-report) query_report_cmd "${1:-}" "${2:-100}" ;;
+    query-verified) query_verified_cmd "${1:-}" "${2:-100}" ;;
+    backtest) backtest_launches_cmd ;;
+    list-webhooks) list_webhooks_cmd ;;
+    create-webhook) create_webhook_cmd ;;
+    list-automations) list_automations_cmd ;;
+    create-automation) create_automation_cmd ;;
+    eval-automation) evaluate_automation_cmd ;;
+    custom) custom_request_cmd ;;
+    help|-h|--help) show_help ;;
+    *)
+      cprint "${FG_ERROR}" "Unknown command: $cmd"
+      show_help
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

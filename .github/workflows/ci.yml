@@ -1,0 +1,45 @@
+name: LaserStream CI
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+jobs:
+  api-tests:
+    name: API (Go + E2E)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: api
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+
+      - name: Run targeted E2E suite
+        run: go test ./... -run TestAPIEndToEndFlow -count=1
+
+      - name: Run full Go test suite
+        run: go test ./...
+
+  ingester-tests:
+    name: Ingester (Rust)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ingester
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run Rust tests
+        run: cargo test --locked

@@ -1,0 +1,66 @@
+# ── Environment & secrets ──────────────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+*.env
+*.secret
+*.pem
+*.key
+*.p12
+*.pfx
+
+# ── Rust / Cargo ───────────────────────────────────────────────────────────────
+ingester/target/
+target/
+**/*.rs.bk
+Cargo.lock.bk
+
+# ── Go ─────────────────────────────────────────────────────────────────────────
+api/bin/
+bin/
+*.exe
+*.test
+*.out
+vendor/
+
+# ── Compiled / binary artifacts ────────────────────────────────────────────────
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.class
+
+# ── OS & editor junk ───────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*~
+.idea/
+*.iml
+.vscode/
+
+# ── Cursor AI tooling (local skill definitions, not project source) ────────────
+.cursor/
+
+# ── Logs & temp files ──────────────────────────────────────────────────────────
+*.log
+*.tmp
+*.temp
+/tmp/
+logs/
+
+# ── Docker compose overrides with local secrets ────────────────────────────────
+docker-compose.override.yml
+
+# ── ClickHouse / database local data dirs ─────────────────────────────────────
+data/
+clickhouse-data/
+postgres-data/
+
+# ── Node (if any tooling is added later) ──────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-error.log*
